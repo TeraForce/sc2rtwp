@@ -1,3 +1,4 @@
+import ida_auto
 import ida_funcs
 import ida_segment
 import ida_xref
@@ -10,6 +11,7 @@ redefine_functions = True
 patch_jumps = True
 c_seh_handler_rva = 0x1DFBD18 # this is not great...
 primary_seh_handlers = []
+_find_sequence_end_cache = {}
 
 def log(level, msg):
     if level <= log_level:
@@ -89,34 +91,43 @@ def check_runtime_functions_equal(ea1, ea2):
             print(f'Unwind data at {hex(ea1)} and {hex(ea2)} differ at word {b}')
 
 # returns None or (ea_start, ea_end, ea_unwind)
-# TODO: can use binary search here...
 def find_unwind_info(imagebase, ea, start, count):
     rva = ea - imagebase
-    for i in range(count):
-        begin = read_runtime_function_start_rva(start, i)
-        end = read_runtime_function_end_rva(start, i)
-        if rva >= begin and rva < end:
-            # found the entry; find all related chained entries
-            index_start = i
-            while unwind_info_chained(imagebase, start, index_start):
-                index_start -= 1
-            if index_start != i:
-                begin = read_runtime_function_start_rva(start, index_start)
+    # binary search: largest i where start_rva[i] <= rva (entries are sorted by start_rva per PE spec)
+    lo, hi = 0, count
+    while lo < hi:
+        mid = (lo + hi) >> 1
+        if read_runtime_function_start_rva(start, mid) <= rva:
+            lo = mid + 1
+        else:
+            hi = mid
+    i = lo - 1
+    if i < 0:
+        return None
+    begin = read_runtime_function_start_rva(start, i)
+    end = read_runtime_function_end_rva(start, i)
+    if rva < begin or rva >= end:
+        return None
+    # found the entry; find all related chained entries
+    index_start = i
+    while unwind_info_chained(imagebase, start, index_start):
+        index_start -= 1
+    if index_start != i:
+        begin = read_runtime_function_start_rva(start, index_start)
 
-            index_end = i + 1
-            while index_end < count and unwind_info_chained(imagebase, start, index_end):
-                index_end += 1
-            if index_end != i + 1:
-                end = read_runtime_function_end_rva(start, index_end - 1)
+    index_end = i + 1
+    while index_end < count and unwind_info_chained(imagebase, start, index_end):
+        index_end += 1
+    if index_end != i + 1:
+        end = read_runtime_function_end_rva(start, index_end - 1)
 
-            # check that all chained ranges are consecutive and point to same root
-            for j in range(index_start + 1, index_end):
-                if read_runtime_function_end_rva(start, j - 1) != read_runtime_function_start_rva(start, j):
-                    print(f'Gap before chained unwind info at {hex(start + 12 * j)}')
-                check_runtime_functions_equal(start + 12 * index_start, unwind_payload_ea(imagebase + read_runtime_function_unwind_rva(start, j)))
+    # check that all chained ranges are consecutive and point to same root
+    for j in range(index_start + 1, index_end):
+        if read_runtime_function_end_rva(start, j - 1) != read_runtime_function_start_rva(start, j):
+            print(f'Gap before chained unwind info at {hex(start + 12 * j)}')
+        check_runtime_functions_equal(start + 12 * index_start, unwind_payload_ea(imagebase + read_runtime_function_unwind_rva(start, j)))
 
-            return (imagebase + begin, imagebase + end, imagebase + read_runtime_function_unwind_rva(start, index_start))
-    return None
+    return (imagebase + begin, imagebase + end, imagebase + read_runtime_function_unwind_rva(start, index_start))
 
 # Conditionals (first instruction is 'jump when set', second is 'jump if not set')
 # OF: jo - jno
@@ -210,6 +221,17 @@ class FakeBranching:
             return self.find_sequence_end(target, True) or target
 
     def find_sequence_end(self, ea, have_jump = False):
+        # Memoize: function is pure given (ea, flags_known, flags_value, have_jump) — only reads
+        # IDB bytes via decode_insn, and during simulate_all() bytes are not modified (patches are
+        # deferred until apply_patches at the end). Cache is reset at the start of each simulate_all.
+        cache_key = (ea, self.flags_known, self.flags_value, have_jump)
+        if cache_key in _find_sequence_end_cache:
+            return _find_sequence_end_cache[cache_key]
+        result = self._find_sequence_end_impl(ea, have_jump)
+        _find_sequence_end_cache[cache_key] = result
+        return result
+
+    def _find_sequence_end_impl(self, ea, have_jump = False):
         #print(f'>> Starting: {hex(ea)}')
         while True:
             #print(f'>>> BR: {hex(ea)}')
@@ -289,14 +311,18 @@ class FakeBranching:
         return ea if have_jump else None # no conditional jumps found...
 
 class ExecutionContext:
-    blocks = [] # (begin, end), sorted and non-overlapping
-    patches = [] # (from, to, long)
-    branches_pending = []
-
     def __init__(self, range_start, range_end, imagebase):
         self.range_start = range_start
         self.range_end = range_end
         self.imagebase = imagebase
+        # NOTE: these MUST be instance attributes. Previously they were declared as class
+        # attributes, which Python shares across instances. Result: every ExecutionContext
+        # accumulated the prior runs' blocks/patches, and apply_patches re-applied every
+        # earlier function's patches into IDB at the end of every later function — O(N^2)
+        # IDB writes.
+        self.blocks = [] # (begin, end), sorted and non-overlapping
+        self.patches = [] # (from, to, long)
+        self.branches_pending = []
 
     # find index of the block with begin > ea (return len(blocks) if none are found)
     def next_block(self, ea):
@@ -412,6 +438,9 @@ class ExecutionContext:
         self.blocks.insert(next_block_idx, (start, ea))
 
     def simulate_all(self, ea):
+        # Cache lifetime is one simulate_all call: bytes are stable during sim, but apply_patches
+        # at the end mutates them, so subsequent calls must start with a clean cache.
+        _find_sequence_end_cache.clear()
         self.queue_simulation(ea)
         while self.branches_pending:
             ea = self.branches_pending.pop(len(self.branches_pending) - 1)
@@ -521,10 +550,19 @@ def process_segment(ea):
         index = chain_end
 
 #process_function(0x140000000, 0x140025A70, 0x140025EE5, 0, 0, 1)
-if process_entire_segment:
-    process_segment(idaapi.get_screen_ea())
-else:
-    process_single_function(idaapi.get_screen_ea())
+# Disable IDA's auto-analyzer during the run: every del_items / create_insn / patch_byte
+# otherwise schedules range re-analysis. With thousands of patches per segment this
+# dominates wall time. We re-enable and auto_wait once at the end so the final IDB state
+# is equivalent.
+ida_auto.enable_auto(False)
+try:
+    if process_entire_segment:
+        process_segment(idaapi.get_screen_ea())
+    else:
+        process_single_function(idaapi.get_screen_ea())
+finally:
+    ida_auto.enable_auto(True)
+    ida_auto.auto_wait()
 
 for h in primary_seh_handlers:
     print(f'Found primary SEH handler: {hex(h)}')
