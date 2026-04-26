@@ -15,9 +15,25 @@ def log(level, msg):
     if level <= log_level:
         print(msg)
 
+# Per-function caches reset by reset_perf_caches() at the start of process_function.
+# Bytes do not change during simulate_all (patches apply afterwards), so caching
+# decoded instructions and find_sequence_end results within one function is safe.
+_decode_cache = {}
+_seq_memo = {}
+
+def reset_perf_caches():
+	_decode_cache.clear()
+	_seq_memo.clear()
+
 def decode_insn(ea):
+	cached = _decode_cache.get(ea)
+	if cached is not None:
+		return cached
 	insn = ida_ua.insn_t()
-	return insn if ida_ua.decode_insn(insn, ea) != 0 else None
+	if ida_ua.decode_insn(insn, ea) == 0:
+		return None
+	_decode_cache[ea] = insn
+	return insn
 
 def decode_prev_insn(ea):
 	insn = ida_ua.insn_t()
@@ -118,6 +134,18 @@ def find_unwind_info(imagebase, ea, start, count):
             return (imagebase + begin, imagebase + end, imagebase + read_runtime_function_unwind_rva(start, index_start))
     return None
 
+# All mnemonics that can be the first non-break case in find_sequence_end.
+# Anything outside this set falls into `case _: break` on the first iteration
+# and returns None (since have_jump starts False), so we can skip the call entirely.
+JUNK_START_MNEMS = frozenset([
+    'nop', 'sal', 'sar', 'shl', 'shr', 'xchg', 'mov', 'or', 'xor', 'and',
+    'test', 'clc', 'stc', 'jmp',
+    'jo', 'jno', 'js', 'jns', 'je', 'jz', 'jne', 'jnz',
+    'jc', 'jb', 'jnae', 'jnc', 'jnb', 'jae',
+    'jp', 'jnp', 'jbe', 'jna', 'jnbe', 'ja',
+    'jl', 'jnge', 'jge', 'jnl', 'jle', 'jng', 'jnle', 'jg',
+])
+
 # Conditionals (first instruction is 'jump when set', second is 'jump if not set')
 # OF: jo - jno
 # SF: js - jns
@@ -210,6 +238,18 @@ class FakeBranching:
             return self.find_sequence_end(target, True) or target
 
     def find_sequence_end(self, ea, have_jump = False):
+        # Memoize: function is pure given (entry ea, entry flag state, entry have_jump).
+        # Mutations to self after entry never escape: the only places that recurse
+        # into find_sequence_end (process_conditional_jump) immediately return
+        # whatever it returns, so post-call state of self is unobserved.
+        memo_key = (ea, self.flags_known, self.flags_value, have_jump)
+        if memo_key in _seq_memo:
+            return _seq_memo[memo_key]
+        result = self._find_sequence_end_impl(ea, have_jump)
+        _seq_memo[memo_key] = result
+        return result
+
+    def _find_sequence_end_impl(self, ea, have_jump):
         #print(f'>> Starting: {hex(ea)}')
         while True:
             #print(f'>>> BR: {hex(ea)}')
@@ -392,8 +432,9 @@ class ExecutionContext:
                 ea += insn.size
                 break
 
-            if patch_jumps and ((ea & 0xF) == 0 or not is_nop(insn)):
+            if patch_jumps and mnem in JUNK_START_MNEMS and ((ea & 0xF) == 0 or not is_nop(insn)):
                 # scrambled jumps always are aligned to 0x10; we can't safely consume preceeding nops, in case the jump itself is a branch target
+                # mnem prefilter: anything outside JUNK_START_MNEMS would break out on the first iteration and return None anyway.
                 branch_seq_end = FakeBranching().find_sequence_end(ea)
                 if branch_seq_end and branch_seq_end != ea and branch_seq_end != ea + 1:
                     long = branch_seq_end > ea + 129 or branch_seq_end < ea - 126
@@ -420,6 +461,7 @@ class ExecutionContext:
 
 
 def process_function(imagebase, ea_start, ea_end, ea_unwind, index, count):
+    reset_perf_caches()
     unwind_flags = read_unwind_info_flag(ea_unwind) if ea_unwind else 0
     log(0, f'Processing function {index}/{count}: {hex(ea_start)} - {hex(ea_end)} unwind={hex(ea_unwind)} flags={hex(unwind_flags)}')
     if unwind_flags >= 4:
